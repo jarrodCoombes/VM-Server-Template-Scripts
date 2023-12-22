@@ -1,5 +1,12 @@
 #!/bin/bash
 
+if [ "$EUID" -ne 0 ]
+    then echo "Please run this as root"
+    exit
+
+    else echo "Root User Detected"
+fi
+
 # Remove keys
 echo Removing Keys
 rm -v /etc/ssh/ssh_host_*
