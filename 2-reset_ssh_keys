@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Remove keys
+echo Removing Keys
+rm -v /etc/ssh/ssh_host_*
+
+echo
+echo
+#Regenerate the keys
+echo Regenerating the Keys
+dpkg-reconfigure openssh-server
+
+echo
+echo
+#Restart SSH
+echo Restarting SSH Server
+systemctl restart ssh
