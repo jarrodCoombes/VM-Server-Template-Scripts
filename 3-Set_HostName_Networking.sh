@@ -176,7 +176,8 @@ echo -e "Network connection established successfully!"
 
 echo -e "Syncronizing time with domain"
  
-    ntpdate $timeServer
+    timedatectl set-timezone 'America/Los_Angeles'
+    # ntpdate $timeServer
  
 echo -e "Grabbing latest software updates"
  
