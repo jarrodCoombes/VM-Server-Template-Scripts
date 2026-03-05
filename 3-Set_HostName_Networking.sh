@@ -174,11 +174,11 @@ echo -e "Restarting network serices"
  
 echo -e "Network connection established successfully!"
 
-echo -e "Syncronizing time with domain"
+echo -e "Setting the timezone"
  
     timedatectl set-timezone 'America/Los_Angeles'
     # ntpdate $timeServer
- 
+  
 echo -e "Grabbing latest software updates"
  
    apt update
