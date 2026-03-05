@@ -130,10 +130,13 @@ echo -e "Setting "$netScript1
 	echo -e '  ethernets: ' >> $netScript1
 	echo -e '    enX0: ' >> $netScript1
 	echo -e '      addresses: ['$ipAddr'/'$cidr'] ' >> $netScript1
-	echo -e '      gateway4: '$defaultGW' ' >> $netScript1
 	echo -e '      nameservers: ' >> $netScript1
 	echo -e '          search: ['$domainName'] ' >> $netScript1
 	echo -e '          addresses: ['$priDNS', '$secDNS'] ' >> $netScript1
+	echo -e '      routes: ' >> $netScript1
+	echo -e '        - to: default' >> $netScript1
+	echo -e '          via: '$defaultGW' ' >> $netScript1
+
 
 echo -e "Setting "$netScript2
 
