@@ -56,7 +56,7 @@ echo -e  '
 '"Please specify the subnet mask:"
 echo -e "Press enter to use the default of 255.255.255.0"
 read subnetMask
-	if [ -n $subnetMask ]; then
+	if [ -z $subnetMask ]; then
    	    subnetMask="255.255.255.0"
 	fi
 	cidr=$(mask2cidr $subnetMask)
@@ -65,7 +65,7 @@ echo -e  '
 '"Please specify the network gateway:"
 echo -e "Press enter to use the default gateway of 10.1.1.1"
 read defaultGW
-	if [ -n $defaultGW ]; then
+	if [ -z $defaultGW ]; then
 		defaultGW="10.1.1.1"
 	fi
  
@@ -74,7 +74,7 @@ echo -e  '
 '"Please specify a primary DNS server:"
 echo -e "Press enter to use the default DNS server of 10.1.1.205"
 read priDNS
-	if [ -n $priDNS ]; then
+	if [ -z $priDNS ]; then
 		priDNS="10.1.1.205"
 	fi
  
@@ -83,7 +83,7 @@ echo -e  '
 '"Please specify a secondary DNS server:"
 echo -e "Press enter to use the default DNS server of 10.1.1.213"
 read secDNS
-	if [ -n $priDNS ]; then
+	if [ -z $priDNS ]; then
 		secDNS="10.1.1.213"
 	fi
 
@@ -161,9 +161,9 @@ echo -e "Restarting network serices"
     ping -q -c 1 $defaultGW > /dev/null
     if [[ $? -ne 0 ]]
     then
-	echo -e "      WARNING: Could not connect, trying to reset networking again, this time with debug output"
-	netplan --debug apply
-        ping -q -c 1 $defaultGW > /dev/null
+	echo -e "      WARNING: Could not connect, trying to reset networking again, this time logging the debug output"
+	netplan --debug apply > netplan.log
+        ping -q -c 1 $defaultGW >> netplan.log
     fi
     if [[ $? -ne 0 ]]
     then
