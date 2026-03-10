@@ -92,7 +92,7 @@ echo -e '
 '"Please specify your NTP Time server."
 echo -e "Press enter to use the default NTP server of time.mpcsd.org"
 read timeServer
-  	if [ -z $timeServer ]; then
+  	if [ -z	 $timeServer ]; then
 		timeServer="time.mpcsd.org"
 	fi
 
@@ -154,35 +154,35 @@ echo -e "Setting hostname"
     hostnamectl set-hostname $hostName
  
 echo -e "Restarting network serices"
-    echo -e "      Running netplan apply"
+echo -e "      Running netplan apply"
     netplan apply
 
-    echo -e "      Testing connectivity."
-    ping -q -c 1 $defaultGW > /dev/null
-    if [[ $? -ne 0 ]]
+echo -e "      Testing connectivity."
+	ping -q -c 1 $defaultGW > /dev/null
+
+if [[ $? -ne 0 ]]
     then
-	echo -e "      WARNING: Could not connect, trying to reset networking again, this time logging the debug output"
-	netplan --debug apply > netplan.log
-        ping -q -c 1 $defaultGW >> netplan.log
-    fi
-    if [[ $? -ne 0 ]]
-    then
-        echo -e "ERROR: Network is unreachable."
-        echo -e "Please verify the network configuration of this host and re-run the script."
-        exit 1
-    fi
- 
+		echo -e "      WARNING: Could not connect, trying to reset networking again, this time logging the debug output"
+		netplan --debug apply > netplan.log 2>&1
+    	ping -c 2 $defaultGW >> netplan.log 2>&1
+		if [[ $? -ne 0 ]]
+    		then
+        		echo -e "      ERROR: Network is unreachable."
+        		echo -e "      Please verify the network configuration of this host and re-run the script."
+        		exit 1
+		fi
+fi
+
 echo -e "Network connection established successfully!"
 
 echo -e "Setting the timezone"
- 
-    timedatectl set-timezone 'America/Los_Angeles'
+	 timedatectl set-timezone 'America/Los_Angeles'
     # ntpdate $timeServer
   
 echo -e "Grabbing latest software updates"
  
    apt update
-   apt upgrade
+   apt upgrade -y
  
 echo -e ''
 echo -e "Initial setup is complete.  It is recommended that you restart"
