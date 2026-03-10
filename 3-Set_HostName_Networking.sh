@@ -92,7 +92,7 @@ echo -e '
 '"Please specify your NTP Time server."
 echo -e "Press enter to use the default NTP server of time.mpcsd.org"
 read timeServer
-  	if [ -n $timeServer ]; then
+  	if [ -z $timeServer ]; then
 		timeServer="time.mpcsd.org"
 	fi
 
