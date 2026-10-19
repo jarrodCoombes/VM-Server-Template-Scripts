@@ -429,8 +429,7 @@ cmd_configure_network() {
 		log_message "ERROR: Could not detect a network interface. Aborting."
 		return 1
 	fi
-
-	clear
+	
 	echo "This will configure the VM's hostname and static network settings."
 	echo "Detected primary network interface: ${iface}"
 	echo "You can re-run this at any time to change these settings."
@@ -639,9 +638,9 @@ check_reboot() {
 # has run. A failure in either is only a warning, so the reboot check in
 # main still runs for the network changes that were already applied.
 run_first_deploy() {
-	cmd_expand_disk
-	cmd_reset_ssh_keys true
 	cmd_configure_network
+	cmd_reset_ssh_keys true
+	cmd_expand_disk
 	cmd_install_tools || log_message "WARNING: Admin tools install failed. Re-run 'install-tools' later."
 	cmd_system_update || log_message "WARNING: System updates failed. Re-run 'system-update' later."
 }
