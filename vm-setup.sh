@@ -505,7 +505,7 @@ install_login_banner() {
 	# Added by ${SCRIPT_NAME}: shows this machine's hostname at login.
 	# Interactive shells only, so scp/rsync/scripted SSH output isn't polluted.
 	if [[ \$- == *i* ]] && command -v toilet >/dev/null 2>&1; then
-	    toilet -f ${BANNER_FONT} "\$(hostname -s)"
+	    echo -e "\e[1;31m\$(toilet -f ${BANNER_FONT} -F center "\$(hostname -s)")\e[0m"
 	fi
 	${BANNER_MARKER_END}
 	EOF
