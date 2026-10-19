@@ -40,9 +40,17 @@ readonly MAX_LOG_LINES=5000
 # working after the repo's default branch was renamed.
 readonly UPDATE_URL="https://raw.githubusercontent.com/jarrodCoombes/VM-Server-Template-Scripts/main/vm-setup.sh"
 
-# Files touched by the networking workflow. Both are backed up (timestamped)
-# before being overwritten, so a bad run can be undone by hand.
-readonly NETPLAN_FILE="/etc/netplan/01-netcfg.yaml"
+# Files touched by the networking workflow. Every existing netplan YAML is
+# moved into a timestamped folder under NETPLAN_BACKUP_ROOT and replaced by
+# the single NETPLAN_FILE, so leftover configs from the template (or
+# cloud-init) can't merge with the new settings. /etc/hosts is backed up in
+# place. Either way a bad run can be undone by hand.
+readonly NETPLAN_DIR="/etc/netplan"
+readonly NETPLAN_FILE="${NETPLAN_DIR}/00-vm-setup-network.yaml"
+# Kept outside /etc/netplan on purpose: netplan reads every *.yaml in its
+# directory, so backups left there would be applied right alongside the
+# new config.
+readonly NETPLAN_BACKUP_ROOT="/var/backups/netplan"
 readonly HOSTS_FILE="/etc/hosts"
 
 # Admin tools installed by the install-tools workflow. btop and toilet come
@@ -163,6 +171,42 @@ backup_file() {
 		cp -p "${target}" "${backup_path}"
 		log_message "Backed up ${target} -> ${backup_path}"
 	fi
+}
+
+# Copies every *.yaml in NETPLAN_DIR into a new timestamped folder under
+# NETPLAN_BACKUP_ROOT, then deletes the originals. Nothing is deleted unless
+# every copy succeeded, so a failed backup leaves the old config in place.
+backup_and_clear_netplan() {
+	local configs=()
+	local config
+	# nullglob makes the glob expand to nothing (instead of the literal
+	# pattern) when no YAML files exist. Scoped to this one expansion.
+	shopt -s nullglob
+	configs=("${NETPLAN_DIR}"/*.yaml)
+	shopt -u nullglob
+
+	if (( ${#configs[@]} == 0 )); then
+		log_message "No existing netplan configs in ${NETPLAN_DIR}; nothing to back up."
+		return 0
+	fi
+
+	local backup_dir
+	backup_dir="${NETPLAN_BACKUP_ROOT}/$(date +%Y%m%d-%H%M%S)"
+	# 700 because netplan files can hold Wi-Fi passwords and are 600 themselves.
+	mkdir -p -m 700 "${backup_dir}"
+
+	for config in "${configs[@]}"; do
+		if ! cp -p "${config}" "${backup_dir}/"; then
+			log_message "ERROR: Could not back up ${config}. No netplan files were removed."
+			return 1
+		fi
+		log_message "Backed up ${config} -> ${backup_dir}/"
+	done
+
+	for config in "${configs[@]}"; do
+		rm -f "${config}"
+		log_message "Removed ${config}"
+	done
 }
 
 # --- Validation helpers ----------------------------------------------------
@@ -372,8 +416,9 @@ detect_primary_interface() {
 }
 
 # Interactive walkthrough that sets the hostname, FQDN, and static network
-# config, replacing netplan's config and /etc/hosts. Backs up both files
-# first. Sets REQUIRE_REBOOT, since a hostname change doesn't reach
+# config. Moves every existing netplan YAML to a backup folder and writes a
+# single new one, and rewrites /etc/hosts after backing it up. Sets
+# REQUIRE_REBOOT, since a hostname change doesn't reach
 # already-running services and shells until a restart.
 cmd_configure_network() {
 	require_root
@@ -421,7 +466,7 @@ cmd_configure_network() {
 		return 0
 	fi
 
-	backup_file "${NETPLAN_FILE}"
+	backup_and_clear_netplan
 	backup_file "${HOSTS_FILE}"
 
 	log_message "Writing ${NETPLAN_FILE} for interface ${iface}."
