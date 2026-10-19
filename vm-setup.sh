@@ -119,13 +119,21 @@ log_message() {
 	timestamp=$(date "+%Y-%m-%d %H:%M:%S")
 	line="${timestamp} - ${message}"
 
+	# Built-in defaults, so a script that never defines the COLOR_* globals
+	# still works under set -u. Define them in SETUP to override. Kept in
+	# variables rather than written inline in the ${...:-...} fallbacks
+	# below, because $'...' isn't reliably expanded inside double quotes.
+	local default_error=$'\e[1;31m'      # bold red
+	local default_warning=$'\e[38;5;208m' # orange
+	local default_reset=$'\e[0m'
+
 	case "${message}" in
-		ERROR:*)   color="${COLOR_ERROR}" ;;
-		WARNING:*) color="${COLOR_WARNING}" ;;
+		ERROR:*)   color="${COLOR_ERROR:-${default_error}}" ;;
+		WARNING:*) color="${COLOR_WARNING:-${default_warning}}" ;;
 	esac
 
 	if [[ -n "${color}" && -t 1 ]]; then
-		echo "${color}${line}${COLOR_RESET}"
+		echo "${color}${line}${COLOR_RESET:-${default_reset}}"
 	else
 		echo "${line}"
 	fi
@@ -348,7 +356,7 @@ cmd_expand_disk() {
 	# (no LVM) needs growpart instead, which is a different workflow --
 	# bail out clearly rather than attempting an lvextend that will fail.
 	if [[ ! "${root_device}" =~ ^/dev/(mapper/|dm-) ]]; then
-		log_message "Root filesystem is not on an LVM logical volume (got: ${root_device}). This script only handles the LVM case; skipping."
+		log_message "WARNING: Root filesystem is not on an LVM logical volume (got: ${root_device}). This script only handles the LVM case; skipping."
 		return 1
 	fi
 
@@ -359,7 +367,7 @@ cmd_expand_disk() {
 	free_extents="$(vgs --noheadings -o vg_free_count "${vg_name}" | xargs)"
 
 	if [[ "${free_extents}" -eq 0 ]]; then
-		log_message "No free space in volume group '${vg_name}'. Nothing to expand. (Grow the virtual disk in the hypervisor first, then re-run this.)"
+		log_message "WARNING: No free space in volume group '${vg_name}'. Nothing to expand. (Grow the virtual disk in the hypervisor first, then re-run this.)"
 		return 0
 	fi
 
