@@ -631,16 +631,17 @@ check_reboot() {
 
 # --- Workflow: first-deploy sequence ---------------------------------------
 
-# The full post-clone flow. The first three steps run as plain calls so
-# strict mode stops the run on any failure -- there's no point installing
-# packages on a box whose network setup failed. Tools and updates come last
-# because a fresh clone may not reach the internet until configure-network
-# has run. A failure in either is only a warning, so the reboot check in
-# main still runs for the network changes that were already applied.
+# The full post-clone flow. configure-network and reset-ssh run as plain
+# calls so strict mode stops the run if either fails -- there's no point
+# installing packages on a box whose network setup failed. Tools and
+# updates come after configure-network because a fresh clone may not reach
+# the internet until it has run. Failures in expand-disk, tools, or updates
+# are only warnings: by then the network changes are already applied, so
+# the run has to carry on to the reboot check in main.
 run_first_deploy() {
 	cmd_configure_network
 	cmd_reset_ssh_keys true
-	cmd_expand_disk
+	cmd_expand_disk || log_message "WARNING: Disk expansion failed. Re-run 'expand-disk' later."
 	cmd_install_tools || log_message "WARNING: Admin tools install failed. Re-run 'install-tools' later."
 	cmd_system_update || log_message "WARNING: System updates failed. Re-run 'system-update' later."
 }
@@ -660,7 +661,7 @@ usage() {
 	  configure-network    Interactive hostname/IP/DNS setup
 	  install-tools        Install admin tools (${TOOL_PACKAGES[*]}) and the hostname login banner
 	  system-update        Install all pending package updates (apt upgrade)
-	  all                  First-deploy flow: expand-disk, reset-ssh, configure-network,
+	  all                  First-deploy flow: configure-network, reset-ssh, expand-disk,
 	                       install-tools, system-update, then reboot if needed
 	  help                 Show this message
 
@@ -677,7 +678,7 @@ show_menu() {
 	echo "4) Configure hostname/networking"
 	echo "5) Install admin tools and login banner"
 	echo "6) Install system updates"
-	echo "7) Run full first-deploy sequence (expand-disk -> reset-ssh -> configure-network -> install-tools -> system-update)"
+	echo "7) Run full first-deploy sequence (configure-network -> reset-ssh -> expand-disk -> install-tools -> system-update)"
 	echo "8) Exit"
 	read -r -p "Choose an option [1-8]: " choice
 	case "${choice}" in
