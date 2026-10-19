@@ -5,7 +5,9 @@
 #              Ubuntu server template. Replaces the old 0/1/2/3-numbered
 #              script set with one file, organized into functions so each
 #              workflow (disk expansion, SSH host key reset, network/hostname
-#              config, self-update) can be run independently or in sequence.
+#              config, admin tools, system updates, self-update) can be run
+#              independently or in sequence. Workflows that need a reboot
+#              set REQUIRE_REBOOT; the reboot prompt happens once, at the end.
 #
 #              Targets Ubuntu 22.04 through 26.04. Assumes bash 4+ and a
 #              netplan-managed, LVM-on-root install (the template's layout).
@@ -42,6 +44,33 @@ readonly UPDATE_URL="https://raw.githubusercontent.com/jarrodCoombes/VM-Server-T
 # before being overwritten, so a bad run can be undone by hand.
 readonly NETPLAN_FILE="/etc/netplan/01-netcfg.yaml"
 readonly HOSTS_FILE="/etc/hosts"
+
+# Admin tools installed by the install-tools workflow. btop and toilet come
+# from the "universe" repo, which is enabled by default on Ubuntu Server.
+readonly TOOL_PACKAGES=(toilet ncdu btop iftop iotop)
+
+# Login banner settings. The banner goes in the system-wide bashrc so every
+# user sees it, not just whoever ran this script. The marker lines bracket
+# the block so a re-run can tell it's already there and skip it.
+readonly BASHRC_FILE="/etc/bash.bashrc"
+readonly BANNER_MARKER_START="# >>> vm-setup hostname banner >>>"
+readonly BANNER_MARKER_END="# <<< vm-setup hostname banner <<<"
+# "future" is a compact 3-line font from toilet-fonts (pulled in as a toilet
+# dependency). The default mono12 is tall and wide enough that longer
+# hostnames wrap on an 80-column terminal.
+readonly BANNER_FONT="future"
+
+# Ubuntu's own "a reboot is needed" signal. apt creates this file when an
+# upgrade touches something that only takes effect on restart (kernel,
+# libc, systemd, etc.).
+readonly REBOOT_REQUIRED_FILE="/run/reboot-required"
+
+# --- Runtime state -------------------------------------------------------
+# Any workflow whose changes need a restart sets this to true instead of
+# rebooting on its own. check_reboot reads it once at the end of the run, so
+# a multi-step flow like `all` asks about rebooting once rather than
+# midway through (which would cut off the remaining steps).
+REQUIRE_REBOOT=false
 
 # Defaults offered during the interactive network prompts -- press Enter to
 # accept. Centralized here instead of buried inline so updating, say, the
@@ -344,7 +373,8 @@ detect_primary_interface() {
 
 # Interactive walkthrough that sets the hostname, FQDN, and static network
 # config, replacing netplan's config and /etc/hosts. Backs up both files
-# first. Ends with an apt upgrade and an optional reboot.
+# first. Sets REQUIRE_REBOOT, since a hostname change doesn't reach
+# already-running services and shells until a restart.
 cmd_configure_network() {
 	require_root
 
@@ -412,6 +442,7 @@ cmd_configure_network() {
 	        - to: default
 	          via: ${gateway}
 	EOF
+	
 	chmod 600 "${NETPLAN_FILE}"
 
 	log_message "Writing ${HOSTS_FILE}."
@@ -447,17 +478,127 @@ cmd_configure_network() {
 
 	log_message "NTP server ${time_server} was collected but this script does not configure an NTP client -- confirm systemd-timesyncd or chrony is pointed at it separately if needed."
 
-	log_message "Fetching latest package updates."
-	apt update
-	apt upgrade -y
+	REQUIRE_REBOOT=true
+	log_message "Network configuration complete. A reboot is needed for the new hostname to take full effect."
+}
 
-	read -r -p "Setup is complete. Reboot now? [y/N] " reboot_confirm
-	if [[ "${reboot_confirm}" =~ ^[Yy]$ ]]; then
+# --- Workflow: admin tools / login banner -----------------------------------
+
+# Appends a block to the system-wide bashrc that prints the short hostname
+# in large text whenever an interactive shell starts. The hostname is looked
+# up at login time (not baked in now), so the banner stays correct after
+# configure-network renames the machine. Skips if the block already exists.
+install_login_banner() {
+	if grep -qF "${BANNER_MARKER_START}" "${BASHRC_FILE}"; then
+		log_message "Login banner already present in ${BASHRC_FILE}; leaving it as-is."
+		return 0
+	fi
+
+	backup_file "${BASHRC_FILE}"
+	log_message "Adding hostname login banner to ${BASHRC_FILE}."
+	# The body lines are indented with spaces, not tabs, because <<- strips
+	# leading tabs. \$ escapes keep those expansions literal in the file so
+	# they run at each login instead of once, right now.
+	cat >> "${BASHRC_FILE}" <<-EOF
+
+	${BANNER_MARKER_START}
+	# Added by ${SCRIPT_NAME}: shows this machine's hostname at login.
+	# Interactive shells only, so scp/rsync/scripted SSH output isn't polluted.
+	if [[ \$- == *i* ]] && command -v toilet >/dev/null 2>&1; then
+	    toilet -f ${BANNER_FONT} "\$(hostname -s)"
+	fi
+	${BANNER_MARKER_END}
+	EOF
+}
+
+# Installs the standard admin toolset (TOOL_PACKAGES) and adds the toilet
+# hostname banner. Safe to re-run: apt skips packages that are already
+# installed, and install_login_banner won't add a second copy of the block.
+cmd_install_tools() {
+	require_root
+
+	log_message "Refreshing package lists."
+	if ! apt update; then
+		log_message "ERROR: apt update failed. Check network access, then re-run 'install-tools'."
+		return 1
+	fi
+
+	log_message "Installing admin tools: ${TOOL_PACKAGES[*]}"
+	if ! apt install -y "${TOOL_PACKAGES[@]}"; then
+		log_message "ERROR: Package install failed. Check that the 'universe' repository is enabled (btop and toilet live there)."
+		return 1
+	fi
+
+	install_login_banner
+	log_message "Admin tools install complete. The banner shows up in new login shells."
+}
+
+# --- Workflow: system updates ----------------------------------------------
+
+# Installs all pending package updates. Sets REQUIRE_REBOOT if apt left the
+# reboot-required flag behind, so a kernel update gets a reboot prompt but a
+# run that only touched userland packages doesn't.
+cmd_system_update() {
+	require_root
+
+	log_message "Refreshing package lists."
+	if ! apt update; then
+		log_message "ERROR: apt update failed. Check network access, then re-run 'system-update'."
+		return 1
+	fi
+
+	log_message "Installing package updates."
+	if ! apt upgrade -y; then
+		log_message "ERROR: apt upgrade failed. Review the apt output above, then re-run 'system-update'."
+		return 1
+	fi
+
+	if [[ -f "${REBOOT_REQUIRED_FILE}" ]]; then
+		REQUIRE_REBOOT=true
+		log_message "System updates complete. These updates need a reboot to take effect."
+	else
+		log_message "System updates complete."
+	fi
+}
+
+# --- Reboot handling -----------------------------------------------------------
+
+# Asks before rebooting, so a run on a box someone is actively using never
+# restarts it unannounced.
+reboot_system() {
+	read -r -p "A reboot is needed to finish setup. Reboot now? [y/N] " reply
+	if [[ "${reply}" =~ ^[Yy]$ ]]; then
 		log_message "Rebooting."
 		reboot
 	else
-		log_message "Reboot skipped -- remember to reboot before this configuration is fully active."
+		log_message "Reboot skipped -- reboot before relying on these changes."
 	fi
+}
+
+# Runs once at the end of every workflow run (see main) and reboots only if
+# something this run set REQUIRE_REBOOT.
+check_reboot() {
+	if [[ "${REQUIRE_REBOOT}" == "true" ]]; then
+		reboot_system
+	else
+		log_message "No reboot needed."
+	fi
+}
+
+# --- Workflow: first-deploy sequence ---------------------------------------
+
+# The full post-clone flow. The first three steps run as plain calls so
+# strict mode stops the run on any failure -- there's no point installing
+# packages on a box whose network setup failed. Tools and updates come last
+# because a fresh clone may not reach the internet until configure-network
+# has run. A failure in either is only a warning, so the reboot check in
+# main still runs for the network changes that were already applied.
+run_first_deploy() {
+	cmd_expand_disk
+	cmd_reset_ssh_keys true
+	cmd_configure_network
+	cmd_install_tools || log_message "WARNING: Admin tools install failed. Re-run 'install-tools' later."
+	cmd_system_update || log_message "WARNING: System updates failed. Re-run 'system-update' later."
 }
 
 # --- Menu / help -------------------------------------------------------------
@@ -473,10 +614,14 @@ usage() {
 	  expand-disk          Grow the root filesystem to fill free VG space (safe to re-run any time)
 	  reset-ssh            Regenerate SSH host keys (asks for confirmation)
 	  configure-network    Interactive hostname/IP/DNS setup
-	  all                  Run expand-disk, reset-ssh, and configure-network in sequence (first-deploy flow)
+	  install-tools        Install admin tools (${TOOL_PACKAGES[*]}) and the hostname login banner
+	  system-update        Install all pending package updates (apt upgrade)
+	  all                  First-deploy flow: expand-disk, reset-ssh, configure-network,
+	                       install-tools, system-update, then reboot if needed
 	  help                 Show this message
 
-	Running with no command opens an interactive menu.
+	Running with no command opens an interactive menu. Any command that needs
+	a reboot asks about it once, at the end of the run.
 	EOF
 }
 
@@ -486,16 +631,20 @@ show_menu() {
 	echo "2) Expand disk"
 	echo "3) Reset SSH host keys"
 	echo "4) Configure hostname/networking"
-	echo "5) Run full first-deploy sequence (expand-disk -> reset-ssh -> configure-network)"
-	echo "6) Exit"
-	read -r -p "Choose an option [1-6]: " choice
+	echo "5) Install admin tools and login banner"
+	echo "6) Install system updates"
+	echo "7) Run full first-deploy sequence (expand-disk -> reset-ssh -> configure-network -> install-tools -> system-update)"
+	echo "8) Exit"
+	read -r -p "Choose an option [1-8]: " choice
 	case "${choice}" in
 		1) cmd_update ;;
 		2) cmd_expand_disk ;;
 		3) cmd_reset_ssh_keys ;;
 		4) cmd_configure_network ;;
-		5) cmd_expand_disk && cmd_reset_ssh_keys true && cmd_configure_network ;;
-		6) exit 0 ;;
+		5) cmd_install_tools ;;
+		6) cmd_system_update ;;
+		7) run_first_deploy ;;
+		8) exit 0 ;;
 		*) echo "Not a valid option." ;;
 	esac
 }
@@ -512,8 +661,11 @@ main() {
 		expand-disk)        cmd_expand_disk ;;
 		reset-ssh)          cmd_reset_ssh_keys ;;
 		configure-network)  cmd_configure_network ;;
-		all)                cmd_expand_disk && cmd_reset_ssh_keys true && cmd_configure_network ;;
-		help|-h|--help)     usage ;;
+		install-tools)      cmd_install_tools ;;
+		system-update)      cmd_system_update ;;
+		all)                run_first_deploy ;;
+		# Help changes nothing, so return before the reboot check.
+		help|-h|--help)     usage; return 0 ;;
 		"")                 show_menu ;;
 		*)
 			echo "Unknown command: ${1}" >&2
@@ -521,6 +673,9 @@ main() {
 			exit 1
 			;;
 	esac
+
+	# One reboot decision per run, after every step has finished.
+	check_reboot
 }
 
 main "$@"
