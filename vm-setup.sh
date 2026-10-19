@@ -35,6 +35,14 @@ readonly SCRIPT_NAME
 readonly LOG_FILE="/var/log/vm-setup.log"
 readonly MAX_LOG_LINES=5000
 
+# Console colors for log lines that start with "ERROR:" or "WARNING:", so
+# problems stand out as output scrolls past. $'...' stores the real escape
+# character, not a literal backslash-e. Orange uses the 256-color palette,
+# which any modern terminal (and SSH session) supports.
+readonly COLOR_ERROR=$'\e[1;31m'      # bold red
+readonly COLOR_WARNING=$'\e[38;5;208m' # orange
+readonly COLOR_RESET=$'\e[0m'
+
 # Raw URL this script updates itself from. Points at "main" -- the old
 # scripts pointed at "master", which is why the update step silently stopped
 # working after the repo's default branch was renamed.
@@ -102,12 +110,31 @@ readonly MAX_SUPPORTED_VERSION="26.04"
 
 # --- Logging (from scripts/snippets/logging.sh) --------------------------
 
-# Log output function
+# Log output function. Errors print in red and warnings in orange on the
+# console; the log file always gets plain text so it stays easy to grep.
+# Colors are skipped when stdout isn't a terminal (piped or redirected).
 log_message() {
 	local message="$1"
-	local timestamp
+	local timestamp line color=""
 	timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-	echo "${timestamp} - ${message}" | tee -a "${LOG_FILE}"
+	line="${timestamp} - ${message}"
+
+	case "${message}" in
+		ERROR:*)   color="${COLOR_ERROR}" ;;
+		WARNING:*) color="${COLOR_WARNING}" ;;
+	esac
+
+	if [[ -n "${color}" && -t 1 ]]; then
+		echo "${color}${line}${COLOR_RESET}"
+	else
+		echo "${line}"
+	fi
+
+	# Console first, then the file: if the log isn't writable (e.g. run
+	# without sudo), the message is still shown instead of strict mode
+	# killing the script before anything prints.
+	# Braces so 2>/dev/null also covers the failed open of LOG_FILE itself.
+	{ echo "${line}" >> "${LOG_FILE}"; } 2>/dev/null || true
 }
 
 # Log rotation function
@@ -345,22 +372,31 @@ cmd_expand_disk() {
 	local fs_type
 	fs_type="$(findmnt -n -o FSTYPE /)"
 	log_message "Growing filesystem (type: ${fs_type})..."
+	# Exit codes are captured explicitly instead of relying on strict mode,
+	# because run_first_deploy calls this with "||", which turns strict
+	# mode off inside the function.
+	local grow_status=0
 	case "${fs_type}" in
 		ext2|ext3|ext4)
-			resize2fs "${root_device}"
+			resize2fs "${root_device}" || grow_status=$?
 			;;
 		xfs)
 			# xfs_growfs takes a mountpoint, not a device.
-			xfs_growfs / >/dev/null
+			xfs_growfs / >/dev/null || grow_status=$?
 			;;
 		btrfs)
-			btrfs filesystem resize max /
+			btrfs filesystem resize max / || grow_status=$?
 			;;
 		*)
 			log_message "WARNING: Logical volume was extended, but '${fs_type}' isn't a filesystem type this script knows how to grow. Extend it manually."
 			return 1
 			;;
 	esac
+
+	if (( grow_status != 0 )); then
+		log_message "ERROR: The logical volume was extended, but growing the ${fs_type} filesystem failed (exit ${grow_status}). Grow it manually."
+		return 1
+	fi
 
 	log_message "Disk expansion complete."
 	df -h /
@@ -389,11 +425,20 @@ cmd_reset_ssh_keys() {
 	log_message "Removing existing SSH host keys."
 	rm -fv /etc/ssh/ssh_host_* | while read -r line; do log_message "  ${line}"; done
 
+	# Each step is checked explicitly instead of relying on strict mode,
+	# because run_first_deploy calls this with "||", which turns strict
+	# mode off inside the function.
 	log_message "Regenerating SSH host keys."
-	dpkg-reconfigure openssh-server
+	if ! dpkg-reconfigure openssh-server; then
+		log_message "ERROR: Regenerating SSH host keys failed. The old keys are already deleted -- run 'sudo ssh-keygen -A' before closing this session, or SSH logins will fail."
+		return 1
+	fi
 
 	log_message "Restarting SSH service."
-	systemctl restart ssh
+	if ! systemctl restart ssh; then
+		log_message "ERROR: New SSH host keys were generated, but restarting the ssh service failed. Check 'systemctl status ssh'."
+		return 1
+	fi
 
 	log_message "SSH host key reset complete."
 }
@@ -631,16 +676,15 @@ check_reboot() {
 
 # --- Workflow: first-deploy sequence ---------------------------------------
 
-# The full post-clone flow. configure-network and reset-ssh run as plain
-# calls so strict mode stops the run if either fails -- there's no point
-# installing packages on a box whose network setup failed. Tools and
-# updates come after configure-network because a fresh clone may not reach
-# the internet until it has run. Failures in expand-disk, tools, or updates
-# are only warnings: by then the network changes are already applied, so
-# the run has to carry on to the reboot check in main.
+# The full post-clone flow. configure-network runs as a plain call so strict
+# mode stops the run if it fails -- there's no point installing packages
+# on a box whose network setup failed. Tools and updates come after it
+# because a fresh clone may not reach the internet until it has run. Every
+# later step logs its failure and carries on: by then the network changes
+# are already applied, so the run has to reach the reboot check in main.
 run_first_deploy() {
 	cmd_configure_network
-	cmd_reset_ssh_keys true
+	cmd_reset_ssh_keys true || log_message "ERROR: SSH host key reset failed. Fix it (see above), then re-run 'reset-ssh'."
 	cmd_expand_disk || log_message "WARNING: Disk expansion failed. Re-run 'expand-disk' later."
 	cmd_install_tools || log_message "WARNING: Admin tools install failed. Re-run 'install-tools' later."
 	cmd_system_update || log_message "WARNING: System updates failed. Re-run 'system-update' later."
@@ -713,7 +757,7 @@ main() {
 		help|-h|--help)     usage; return 0 ;;
 		"")                 show_menu ;;
 		*)
-			echo "Unknown command: ${1}" >&2
+			log_message "ERROR: Unknown command: ${1}"
 			usage
 			exit 1
 			;;
