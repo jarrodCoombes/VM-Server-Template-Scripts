@@ -338,8 +338,65 @@ cmd_update() {
 
 # --- Workflow: disk expansion -----------------------------------------------
 
-# Grows the root filesystem to fill whatever free space exists in its
-# volume group. Detects the root device and filesystem type at runtime
+# Stretches every partition backing volume group $1 to the end of its disk
+# (growpart), then tells LVM the partition got bigger (pvresize). Without
+# this, space added to the virtual disk in the hypervisor sits after the
+# last partition where LVM can't see it, and the VG reports 0 free.
+# Exit codes are checked explicitly because run_first_deploy calls
+# cmd_expand_disk with "||", which turns strict mode off inside it.
+grow_physical_volumes() {
+	local vg_name="$1"
+	local pv_list pv pv_kernel_name parent_disk part_num grow_output grow_status
+
+	# awk instead of pvs -S so this works on older lvm2 builds too.
+	pv_list="$(pvs --noheadings -o pv_name,vg_name | awk -v vg="${vg_name}" '$2 == vg {print $1}')"
+	if [[ -z "${pv_list}" ]]; then
+		log_message "ERROR: Could not find the physical volumes for volume group '${vg_name}'."
+		return 1
+	fi
+
+	if ! command -v growpart >/dev/null 2>&1; then
+		log_message "ERROR: growpart is not installed. Install it with 'apt install cloud-guest-utils', then re-run 'expand-disk'."
+		return 1
+	fi
+
+	while read -r pv; do
+		[[ -z "${pv}" ]] && continue
+		# Resolve /dev/mapper-style symlinks to the kernel name (e.g. xvda3)
+		# so the sysfs lookups below find it.
+		pv_kernel_name="$(basename "$(readlink -f "${pv}")")"
+
+		# Only partitions have a "partition" file in sysfs, holding their
+		# number. A PV on a whole disk has no partition to grow, so it
+		# skips straight to pvresize.
+		if [[ -f "/sys/class/block/${pv_kernel_name}/partition" ]]; then
+			part_num="$(< "/sys/class/block/${pv_kernel_name}/partition")"
+			parent_disk="$(lsblk -no PKNAME "/dev/${pv_kernel_name}" | head -n 1)"
+			log_message "Growing partition ${part_num} on /dev/${parent_disk} to fill the disk..."
+
+			# growpart exits 1 with "NOCHANGE" when the partition already
+			# fills the disk. That's fine (the disk may not have been grown),
+			# so only treat other failures as errors.
+			grow_status=0
+			grow_output="$(growpart "/dev/${parent_disk}" "${part_num}" 2>&1)" || grow_status=$?
+			echo "${grow_output}"
+			if (( grow_status != 0 )) && [[ "${grow_output}" != *NOCHANGE* ]]; then
+				log_message "ERROR: growpart failed on /dev/${parent_disk} partition ${part_num} (exit ${grow_status}). No LVM changes were made."
+				return 1
+			fi
+		fi
+
+		log_message "Resizing LVM physical volume ${pv}..."
+		if ! pvresize "${pv}"; then
+			log_message "ERROR: pvresize failed on ${pv}. The partition may have grown, but LVM can't use the new space yet."
+			return 1
+		fi
+	done <<< "${pv_list}"
+}
+
+# Grows the root filesystem to fill all unused space on its disk: first the
+# partition and LVM physical volume (grow_physical_volumes), then the
+# logical volume, then the filesystem. Detects the root device and filesystem type at runtime
 # (rather than assuming /dev/ubuntu-vg/ubuntu-lv and ext4) so it keeps
 # working if the template's VG/LV names change, and so it can be re-run any
 # time -- not just right after cloning -- to pick up a disk that was grown
@@ -360,14 +417,21 @@ cmd_expand_disk() {
 		return 1
 	fi
 
-	# Report free space before touching anything, mainly so a re-run that
-	# finds nothing to do isn't a mystery.
 	local vg_name free_extents
 	vg_name="$(lvs --noheadings -o vg_name "${root_device}" | xargs)"
+
+	# Pull any unpartitioned space on the disk into the volume group first,
+	# so the free-space check below sees it.
+	if ! grow_physical_volumes "${vg_name}"; then
+		return 1
+	fi
+
+	# Report free space before touching the LV, mainly so a re-run that
+	# finds nothing to do isn't a mystery.
 	free_extents="$(vgs --noheadings -o vg_free_count "${vg_name}" | xargs)"
 
 	if [[ "${free_extents}" -eq 0 ]]; then
-		log_message "WARNING: No free space in volume group '${vg_name}'. Nothing to expand. (Grow the virtual disk in the hypervisor first, then re-run this.)"
+		log_message "WARNING: No free space in volume group '${vg_name}' and no unpartitioned space on the disk. Nothing to expand. (Grow the virtual disk in the hypervisor first, then re-run this.)"
 		return 0
 	fi
 
