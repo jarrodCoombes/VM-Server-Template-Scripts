@@ -338,16 +338,38 @@ cmd_update() {
 
 # --- Workflow: disk expansion -----------------------------------------------
 
-# Stretches every partition backing volume group $1 to the end of its disk
-# (growpart), then tells LVM the partition got bigger (pvresize). Without
-# this, space added to the virtual disk in the hypervisor sits after the
-# last partition where LVM can't see it, and the VG reports 0 free.
-# Exit codes are checked explicitly because run_first_deploy calls
-# cmd_expand_disk with "||", which turns strict mode off inside it.
-grow_physical_volumes() {
-	local vg_name="$1"
-	local pv_list pv pv_kernel_name parent_disk part_num grow_output grow_status
+# Grows the root filesystem to fill all unused space on its disk, in the
+# same order as doing it by hand:
+#   1. growpart  - stretch each partition backing the root VG to the end
+#                  of its disk (new hypervisor space lands after the last
+#                  partition, where LVM can't see it)
+#   2. pvresize  - tell LVM the partition got bigger
+#   3. lvextend  - give the VG's free space to the root logical volume
+#   4. grow the filesystem (resize2fs / xfs_growfs / btrfs)
+# Detects the root device, VG, partitions and filesystem type at runtime
+# (rather than assuming /dev/ubuntu-vg/ubuntu-lv, xvda3 and ext4) so it
+# keeps working if the template's layout changes, and so it can be re-run
+# any time to pick up a disk that was grown in the hypervisor later.
+# Exit codes are checked explicitly instead of relying on strict mode,
+# because run_first_deploy calls this with "||", which turns strict mode
+# off inside the function.
+cmd_expand_disk() {
+	require_root
+	log_message "Starting disk expansion check."
 
+	local root_device
+	root_device="$(findmnt -n -o SOURCE /)"
+	log_message "Root filesystem device: ${root_device}"
+
+	# Only LVM logical volumes can be grown this way -- bail out clearly
+	# rather than attempting an lvextend that will fail.
+	if [[ ! "${root_device}" =~ ^/dev/(mapper/|dm-) ]]; then
+		log_message "WARNING: Root filesystem is not on an LVM logical volume (got: ${root_device}). This script only handles the LVM case; skipping."
+		return 1
+	fi
+
+	local vg_name pv_list
+	vg_name="$(lvs --noheadings -o vg_name "${root_device}" | xargs)"
 	# awk instead of pvs -S so this works on older lvm2 builds too.
 	pv_list="$(pvs --noheadings -o pv_name,vg_name | awk -v vg="${vg_name}" '$2 == vg {print $1}')"
 	if [[ -z "${pv_list}" ]]; then
@@ -360,6 +382,14 @@ grow_physical_volumes() {
 		return 1
 	fi
 
+	# Free space on / before anything changes, for the before/after summary
+	# at the end. --output=avail prints just df -h's "Avail" column; tail
+	# drops its header and xargs trims the padding.
+	local free_before free_after
+	free_before="$(df -h --output=avail / | tail -n 1 | xargs)"
+
+	# --- Steps 1 and 2: grow each partition, then its LVM physical volume ---
+	local pv pv_kernel_name parent_disk part_num growpart_output growpart_status
 	while read -r pv; do
 		[[ -z "${pv}" ]] && continue
 		# Resolve /dev/mapper-style symlinks to the kernel name (e.g. xvda3)
@@ -377,11 +407,11 @@ grow_physical_volumes() {
 			# growpart exits 1 with "NOCHANGE" when the partition already
 			# fills the disk. That's fine (the disk may not have been grown),
 			# so only treat other failures as errors.
-			grow_status=0
-			grow_output="$(growpart "/dev/${parent_disk}" "${part_num}" 2>&1)" || grow_status=$?
-			echo "${grow_output}"
-			if (( grow_status != 0 )) && [[ "${grow_output}" != *NOCHANGE* ]]; then
-				log_message "ERROR: growpart failed on /dev/${parent_disk} partition ${part_num} (exit ${grow_status}). No LVM changes were made."
+			growpart_status=0
+			growpart_output="$(growpart "/dev/${parent_disk}" "${part_num}" 2>&1)" || growpart_status=$?
+			echo "${growpart_output}"
+			if (( growpart_status != 0 )) && [[ "${growpart_output}" != *NOCHANGE* ]]; then
+				log_message "ERROR: growpart failed on /dev/${parent_disk} partition ${part_num} (exit ${growpart_status}). No LVM changes were made."
 				return 1
 			fi
 		fi
@@ -392,42 +422,11 @@ grow_physical_volumes() {
 			return 1
 		fi
 	done <<< "${pv_list}"
-}
 
-# Grows the root filesystem to fill all unused space on its disk: first the
-# partition and LVM physical volume (grow_physical_volumes), then the
-# logical volume, then the filesystem. Detects the root device and filesystem type at runtime
-# (rather than assuming /dev/ubuntu-vg/ubuntu-lv and ext4) so it keeps
-# working if the template's VG/LV names change, and so it can be re-run any
-# time -- not just right after cloning -- to pick up a disk that was grown
-# in the hypervisor later.
-cmd_expand_disk() {
-	require_root
-	log_message "Starting disk expansion check."
-
-	local root_device
-	root_device="$(findmnt -n -o SOURCE /)"
-	log_message "Root filesystem device: ${root_device}"
-
-	# Only LVM logical volumes can be grown this way. A plain partition
-	# (no LVM) needs growpart instead, which is a different workflow --
-	# bail out clearly rather than attempting an lvextend that will fail.
-	if [[ ! "${root_device}" =~ ^/dev/(mapper/|dm-) ]]; then
-		log_message "WARNING: Root filesystem is not on an LVM logical volume (got: ${root_device}). This script only handles the LVM case; skipping."
-		return 1
-	fi
-
-	local vg_name free_extents
-	vg_name="$(lvs --noheadings -o vg_name "${root_device}" | xargs)"
-
-	# Pull any unpartitioned space on the disk into the volume group first,
-	# so the free-space check below sees it.
-	if ! grow_physical_volumes "${vg_name}"; then
-		return 1
-	fi
-
+	# --- Step 3: extend the logical volume --------------------------------
 	# Report free space before touching the LV, mainly so a re-run that
 	# finds nothing to do isn't a mystery.
+	local free_extents
 	free_extents="$(vgs --noheadings -o vg_free_count "${vg_name}" | xargs)"
 
 	if [[ "${free_extents}" -eq 0 ]]; then
@@ -441,12 +440,10 @@ cmd_expand_disk() {
 		return 1
 	fi
 
+	# --- Step 4: grow the filesystem --------------------------------------
 	local fs_type
 	fs_type="$(findmnt -n -o FSTYPE /)"
 	log_message "Growing filesystem (type: ${fs_type})..."
-	# Exit codes are captured explicitly instead of relying on strict mode,
-	# because run_first_deploy calls this with "||", which turns strict
-	# mode off inside the function.
 	local grow_status=0
 	case "${fs_type}" in
 		ext2|ext3|ext4)
@@ -470,8 +467,8 @@ cmd_expand_disk() {
 		return 1
 	fi
 
-	log_message "Disk expansion complete."
-	df -h /
+	free_after="$(df -h --output=avail / | tail -n 1 | xargs)"
+	log_message "Disk expansion complete. Free space before resize: ${free_before}, free space after resize: ${free_after}."
 }
 
 # --- Workflow: SSH host key reset -------------------------------------------
