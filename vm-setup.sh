@@ -769,7 +769,8 @@ usage() {
 
 	Commands:
 	  update               Pull the latest version of this script from GitHub
-	  expand-disk          Grow the root filesystem to fill free VG space (safe to re-run any time)
+	  expand-disk          Grow the root partition, LVM volume, and filesystem to fill the disk
+	                       (safe to re-run any time)
 	  reset-ssh            Regenerate SSH host keys (asks for confirmation)
 	  configure-network    Interactive hostname/IP/DNS setup
 	  install-tools        Install admin tools (${TOOL_PACKAGES[*]}) and the hostname login banner
